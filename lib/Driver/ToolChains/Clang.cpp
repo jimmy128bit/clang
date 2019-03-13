@@ -1,9 +1,8 @@
-//===--- LLVM.cpp - Clang+LLVM ToolChain Implementations --------*- C++ -*-===//
+//===-- Clang.cpp - Clang+LLVM ToolChain Implementations --------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +18,7 @@
 #include "AMDGPU.h"
 #include "CommonArgs.h"
 #include "Hexagon.h"
+#include "MSP430.h"
 #include "InputInfo.h"
 #include "PS4CPU.h"
 #include "clang/Basic/CharInfo.h"
@@ -364,6 +364,8 @@ static void getTargetFeatures(const ToolChain &TC, const llvm::Triple &Triple,
   case llvm::Triple::amdgcn:
     amdgpu::getAMDGPUTargetFeatures(D, Args, Features);
     break;
+  case llvm::Triple::msp430:
+    msp430::getMSP430TargetFeatures(D, Args, Features);
   }
 
   // Find the last of each feature.
@@ -517,6 +519,7 @@ static bool useFramePointerForTargetByDefault(const ArgList &Args,
   case llvm::Triple::xcore:
   case llvm::Triple::wasm32:
   case llvm::Triple::wasm64:
+  case llvm::Triple::msp430:
     // XCore never wants frame pointers, regardless of OS.
     // WebAssembly never wants frame pointers.
     return false;
@@ -726,6 +729,13 @@ static void addPGOAndCoverageFlags(Compilation &C, const Driver &D,
       PGOGenerateArg->getOption().matches(options::OPT_fno_profile_generate))
     PGOGenerateArg = nullptr;
 
+  auto *CSPGOGenerateArg = Args.getLastArg(options::OPT_fcs_profile_generate,
+                                           options::OPT_fcs_profile_generate_EQ,
+                                           options::OPT_fno_profile_generate);
+  if (CSPGOGenerateArg &&
+      CSPGOGenerateArg->getOption().matches(options::OPT_fno_profile_generate))
+    CSPGOGenerateArg = nullptr;
+
   auto *ProfileGenerateArg = Args.getLastArg(
       options::OPT_fprofile_instr_generate,
       options::OPT_fprofile_instr_generate_EQ,
@@ -749,6 +759,10 @@ static void addPGOAndCoverageFlags(Compilation &C, const Driver &D,
     D.Diag(diag::err_drv_argument_not_allowed_with)
         << ProfileGenerateArg->getSpelling() << ProfileUseArg->getSpelling();
 
+  if (CSPGOGenerateArg && PGOGenerateArg)
+    D.Diag(diag::err_drv_argument_not_allowed_with)
+        << CSPGOGenerateArg->getSpelling() << PGOGenerateArg->getSpelling();
+
   if (ProfileGenerateArg) {
     if (ProfileGenerateArg->getOption().matches(
             options::OPT_fprofile_instr_generate_EQ))
@@ -758,11 +772,22 @@ static void addPGOAndCoverageFlags(Compilation &C, const Driver &D,
     CmdArgs.push_back("-fprofile-instrument=clang");
   }
 
+  Arg *PGOGenArg = nullptr;
   if (PGOGenerateArg) {
+    assert(!CSPGOGenerateArg);
+    PGOGenArg = PGOGenerateArg;
     CmdArgs.push_back("-fprofile-instrument=llvm");
-    if (PGOGenerateArg->getOption().matches(
-            options::OPT_fprofile_generate_EQ)) {
-      SmallString<128> Path(PGOGenerateArg->getValue());
+  }
+  if (CSPGOGenerateArg) {
+    assert(!PGOGenerateArg);
+    PGOGenArg = CSPGOGenerateArg;
+    CmdArgs.push_back("-fprofile-instrument=csllvm");
+  }
+  if (PGOGenArg) {
+    if (PGOGenArg->getOption().matches(
+            PGOGenerateArg ? options::OPT_fprofile_generate_EQ
+                           : options::OPT_fcs_profile_generate_EQ)) {
+      SmallString<128> Path(PGOGenArg->getValue());
       llvm::sys::path::append(Path, "default_%m.profraw");
       CmdArgs.push_back(
           Args.MakeArgString(Twine("-fprofile-instrument-path=") + Path));
@@ -1712,6 +1737,14 @@ void Clang::AddMIPSTargetArgs(const ArgList &Args,
             << A->getOption().getName() << Val;
     } else
       D.Diag(diag::warn_target_unsupported_compact_branches) << CPUName;
+  }
+
+  if (Arg *A = Args.getLastArg(options::OPT_mrelax_pic_calls,
+                               options::OPT_mno_relax_pic_calls)) {
+    if (A->getOption().matches(options::OPT_mno_relax_pic_calls)) {
+      CmdArgs.push_back("-mllvm");
+      CmdArgs.push_back("-mips-jalr-reloc=0");
+    }
   }
 }
 
@@ -3454,13 +3487,25 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       NormalizedTriple = C.getSingleOffloadToolChain<Action::OFK_Host>()
                              ->getTriple()
                              .normalize();
-    else
+    else {
+      // Host-side compilation.
       NormalizedTriple =
           (IsCuda ? C.getSingleOffloadToolChain<Action::OFK_Cuda>()
                   : C.getSingleOffloadToolChain<Action::OFK_HIP>())
               ->getTriple()
               .normalize();
-
+      if (IsCuda) {
+        // We need to figure out which CUDA version we're compiling for, as that
+        // determines how we load and launch GPU kernels.
+        auto *CTC = static_cast<const toolchains::CudaToolChain *>(
+            C.getSingleOffloadToolChain<Action::OFK_Cuda>());
+        assert(CTC && "Expected valid CUDA Toolchain.");
+        if (CTC && CTC->CudaInstallation.version() != CudaVersion::UNKNOWN)
+          CmdArgs.push_back(Args.MakeArgString(
+              Twine("-target-sdk-version=") +
+              CudaVersionToString(CTC->CudaInstallation.version())));
+      }
+    }
     CmdArgs.push_back("-aux-triple");
     CmdArgs.push_back(Args.MakeArgString(NormalizedTriple));
   }
@@ -3786,6 +3831,13 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     if (IsPIE)
       CmdArgs.push_back("-pic-is-pie");
   }
+
+  if (RelocationModel == llvm::Reloc::ROPI ||
+      RelocationModel == llvm::Reloc::ROPI_RWPI)
+    CmdArgs.push_back("-fropi");
+  if (RelocationModel == llvm::Reloc::RWPI ||
+      RelocationModel == llvm::Reloc::ROPI_RWPI)
+    CmdArgs.push_back("-frwpi");
 
   if (Arg *A = Args.getLastArg(options::OPT_meabi)) {
     CmdArgs.push_back("-meabi");
@@ -4434,6 +4486,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       Args.AddAllArgs(CmdArgs, options::OPT_fopenmp_version_EQ);
       Args.AddAllArgs(CmdArgs, options::OPT_fopenmp_cuda_number_of_sm_EQ);
       Args.AddAllArgs(CmdArgs, options::OPT_fopenmp_cuda_blocks_per_sm_EQ);
+      Args.AddAllArgs(CmdArgs,
+                      options::OPT_fopenmp_cuda_teams_reduction_recs_num_EQ);
       if (Args.hasFlag(options::OPT_fopenmp_optimistic_collapse,
                        options::OPT_fno_openmp_optimistic_collapse,
                        /*Default=*/false))
@@ -4581,6 +4635,14 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   // Forward -f options with positive and negative forms; we translate
   // these by hand.
   if (Arg *A = getLastProfileSampleUseArg(Args)) {
+    auto *PGOArg = Args.getLastArg(
+        options::OPT_fprofile_generate, options::OPT_fprofile_generate_EQ,
+        options::OPT_fcs_profile_generate, options::OPT_fcs_profile_generate_EQ,
+        options::OPT_fprofile_use, options::OPT_fprofile_use_EQ);
+    if (PGOArg)
+      D.Diag(diag::err_drv_argument_not_allowed_with)
+          << "SampleUse with PGO options";
+
     StringRef fname = A->getValue();
     if (!llvm::sys::fs::exists(fname))
       D.Diag(diag::err_drv_no_such_file) << fname;
@@ -4970,8 +5032,11 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
                    options::OPT_fno_apple_pragma_pack, false))
     CmdArgs.push_back("-fapple-pragma-pack");
 
+  // Remarks can be enabled with any of the `-f.*optimization-record.*` flags.
   if (Args.hasFlag(options::OPT_fsave_optimization_record,
                    options::OPT_foptimization_record_file_EQ,
+                   options::OPT_fno_save_optimization_record, false) ||
+      Args.hasFlag(options::OPT_foptimization_record_passes_EQ,
                    options::OPT_fno_save_optimization_record, false)) {
     CmdArgs.push_back("-opt-record-file");
 
@@ -5005,6 +5070,11 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
 
       llvm::sys::path::replace_extension(F, "opt.yaml");
       CmdArgs.push_back(Args.MakeArgString(F));
+    }
+    if (const Arg *A =
+            Args.getLastArg(options::OPT_foptimization_record_passes_EQ)) {
+      CmdArgs.push_back("-opt-record-passes");
+      CmdArgs.push_back(A->getValue());
     }
   }
 
@@ -5052,6 +5122,13 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   for (const Arg *A : Args.filtered(options::OPT_fplugin_EQ)) {
     CmdArgs.push_back("-load");
     CmdArgs.push_back(A->getValue());
+    A->claim();
+  }
+
+  // Forward -fpass-plugin=name.so to -cc1.
+  for (const Arg *A : Args.filtered(options::OPT_fpass_plugin_EQ)) {
+    CmdArgs.push_back(
+        Args.MakeArgString(Twine("-fpass-plugin=") + A->getValue()));
     A->claim();
   }
 
@@ -5226,6 +5303,17 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back("-fwhole-program-vtables");
   }
 
+  bool RequiresSplitLTOUnit = WholeProgramVTables || Sanitize.needsLTO();
+  bool SplitLTOUnit =
+      Args.hasFlag(options::OPT_fsplit_lto_unit,
+                   options::OPT_fno_split_lto_unit, RequiresSplitLTOUnit);
+  if (RequiresSplitLTOUnit && !SplitLTOUnit)
+    D.Diag(diag::err_drv_argument_not_allowed_with)
+        << "-fno-split-lto-unit"
+        << (WholeProgramVTables ? "-fwhole-program-vtables" : "-fsanitize=cfi");
+  if (SplitLTOUnit)
+    CmdArgs.push_back("-fsplit-lto-unit");
+
   if (Arg *A = Args.getLastArg(options::OPT_fexperimental_isel,
                                options::OPT_fno_experimental_isel)) {
     CmdArgs.push_back("-mllvm");
@@ -5255,6 +5343,17 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     } else {
       CmdArgs.push_back("-global-isel=0");
     }
+  }
+
+  if (Args.hasArg(options::OPT_forder_file_instrumentation)) {
+     CmdArgs.push_back("-forder-file-instrumentation");
+     // Enable order file instrumentation when ThinLTO is not on. When ThinLTO is
+     // on, we need to pass these flags as linker flags and that will be handled
+     // outside of the compiler.
+     if (!D.isUsingLTO()) {
+       CmdArgs.push_back("-mllvm");
+       CmdArgs.push_back("-enable-order-file-instrumentation");
+     }
   }
 
   if (Arg *A = Args.getLastArg(options::OPT_fforce_enable_int128,

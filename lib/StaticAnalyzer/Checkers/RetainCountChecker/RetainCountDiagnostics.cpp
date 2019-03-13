@@ -1,9 +1,8 @@
 // RetainCountDiagnostics.cpp - Checks for leaks and other issues -*- C++ -*--//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -18,6 +17,56 @@
 using namespace clang;
 using namespace ento;
 using namespace retaincountchecker;
+
+StringRef RefCountBug::bugTypeToName(RefCountBug::RefCountBugType BT) {
+  switch (BT) {
+  case UseAfterRelease:
+    return "Use-after-release";
+  case ReleaseNotOwned:
+    return "Bad release";
+  case DeallocNotOwned:
+    return "-dealloc sent to non-exclusively owned object";
+  case FreeNotOwned:
+    return "freeing non-exclusively owned object";
+  case OverAutorelease:
+    return "Object autoreleased too many times";
+  case ReturnNotOwnedForOwned:
+    return "Method should return an owned object";
+  case LeakWithinFunction:
+    return "Leak";
+  case LeakAtReturn:
+    return "Leak of returned object";
+  }
+  llvm_unreachable("Unknown RefCountBugType");
+}
+
+StringRef RefCountBug::getDescription() const {
+  switch (BT) {
+  case UseAfterRelease:
+    return "Reference-counted object is used after it is released";
+  case ReleaseNotOwned:
+    return "Incorrect decrement of the reference count of an object that is "
+           "not owned at this point by the caller";
+  case DeallocNotOwned:
+    return "-dealloc sent to object that may be referenced elsewhere";
+  case FreeNotOwned:
+    return  "'free' called on an object that may be referenced elsewhere";
+  case OverAutorelease:
+    return "Object autoreleased too many times";
+  case ReturnNotOwnedForOwned:
+    return "Object with a +0 retain count returned to caller where a +1 "
+           "(owning) retain count is expected";
+  case LeakWithinFunction:
+  case LeakAtReturn:
+    return "";
+  }
+  llvm_unreachable("Unknown RefCountBugType");
+}
+
+RefCountBug::RefCountBug(const CheckerBase *Checker, RefCountBugType BT)
+    : BugType(Checker, bugTypeToName(BT), categories::MemoryRefCount,
+              /*SupressOnSink=*/BT == LeakWithinFunction || BT == LeakAtReturn),
+      BT(BT), Checker(Checker) {}
 
 static bool isNumericLiteralExpression(const Expr *E) {
   // FIXME: This set of cases was copied from SemaExprObjC.
@@ -42,7 +91,8 @@ static std::string getPrettyTypeName(QualType QT) {
 /// Write information about the type state change to {@code os},
 /// return whether the note should be generated.
 static bool shouldGenerateNote(llvm::raw_string_ostream &os,
-                               const RefVal *PrevT, const RefVal &CurrV,
+                               const RefVal *PrevT,
+                               const RefVal &CurrV,
                                bool DeallocSent) {
   // Get the previous type state.
   RefVal PrevV = *PrevT;
@@ -113,11 +163,56 @@ static bool shouldGenerateNote(llvm::raw_string_ostream &os,
   return true;
 }
 
+/// Finds argument index of the out paramter in the call {@code S}
+/// corresponding to the symbol {@code Sym}.
+/// If none found, returns None.
+static Optional<unsigned> findArgIdxOfSymbol(ProgramStateRef CurrSt,
+                                             const LocationContext *LCtx,
+                                             SymbolRef &Sym,
+                                             Optional<CallEventRef<>> CE) {
+  if (!CE)
+    return None;
+
+  for (unsigned Idx = 0; Idx < (*CE)->getNumArgs(); Idx++)
+    if (const MemRegion *MR = (*CE)->getArgSVal(Idx).getAsRegion())
+      if (const auto *TR = dyn_cast<TypedValueRegion>(MR))
+        if (CurrSt->getSVal(MR, TR->getValueType()).getAsSymExpr() == Sym)
+          return Idx;
+
+  return None;
+}
+
+static Optional<std::string> findMetaClassAlloc(const Expr *Callee) {
+  if (const auto *ME = dyn_cast<MemberExpr>(Callee)) {
+    if (ME->getMemberDecl()->getNameAsString() != "alloc")
+      return None;
+    const Expr *This = ME->getBase()->IgnoreParenImpCasts();
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(This)) {
+      const ValueDecl *VD = DRE->getDecl();
+      if (VD->getNameAsString() != "metaClass")
+        return None;
+
+      if (const auto *RD = dyn_cast<CXXRecordDecl>(VD->getDeclContext()))
+        return RD->getNameAsString();
+
+    }
+  }
+  return None;
+}
+
+static std::string findAllocatedObjectName(const Stmt *S, QualType QT) {
+  if (const auto *CE = dyn_cast<CallExpr>(S))
+    if (auto Out = findMetaClassAlloc(CE->getCallee()))
+      return *Out;
+  return getPrettyTypeName(QT);
+}
+
 static void generateDiagnosticsForCallLike(ProgramStateRef CurrSt,
                                            const LocationContext *LCtx,
                                            const RefVal &CurrV, SymbolRef &Sym,
                                            const Stmt *S,
                                            llvm::raw_string_ostream &os) {
+  CallEventManager &Mgr = CurrSt->getStateManager().getCallEventManager();
   if (const CallExpr *CE = dyn_cast<CallExpr>(S)) {
     // Get the name of the callee (if it is available)
     // from the tracked SVal.
@@ -139,7 +234,6 @@ static void generateDiagnosticsForCallLike(ProgramStateRef CurrSt,
     os << "Operator 'new'";
   } else {
     assert(isa<ObjCMessageExpr>(S));
-    CallEventManager &Mgr = CurrSt->getStateManager().getCallEventManager();
     CallEventRef<ObjCMethodCall> Call =
         Mgr.getObjCMethodCall(cast<ObjCMessageExpr>(S), CurrSt, LCtx);
 
@@ -156,13 +250,21 @@ static void generateDiagnosticsForCallLike(ProgramStateRef CurrSt,
     }
   }
 
-   os << " returns ";
+  Optional<CallEventRef<>> CE = Mgr.getCall(S, CurrSt, LCtx);
+  auto Idx = findArgIdxOfSymbol(CurrSt, LCtx, Sym, CE);
+
+  // If index is not found, we assume that the symbol was returned.
+  if (!Idx) {
+    os << " returns ";
+  } else {
+    os << " writes ";
+  }
 
   if (CurrV.getObjKind() == ObjKind::CF) {
     os << "a Core Foundation object of type '"
        << Sym->getType().getAsString() << "' with a ";
   } else if (CurrV.getObjKind() == ObjKind::OS) {
-    os << "an OSObject of type '" << getPrettyTypeName(Sym->getType())
+    os << "an OSObject of type '" << findAllocatedObjectName(S, Sym->getType())
        << "' with a ";
   } else if (CurrV.getObjKind() == ObjKind::Generalized) {
     os << "an object of type '" << Sym->getType().getAsString()
@@ -184,6 +286,25 @@ static void generateDiagnosticsForCallLike(ProgramStateRef CurrSt,
   } else {
     assert(CurrV.isNotOwned());
     os << "+0 retain count";
+  }
+
+  if (Idx) {
+    os << " into an out parameter '";
+    const ParmVarDecl *PVD = (*CE)->parameters()[*Idx];
+    PVD->getNameForDiagnostic(os, PVD->getASTContext().getPrintingPolicy(),
+                              /*Qualified=*/false);
+    os << "'";
+
+    QualType RT = (*CE)->getResultType();
+    if (!RT.isNull() && !RT->isVoidType()) {
+      SVal RV = (*CE)->getReturnValue();
+      if (CurrSt->isNull(RV).isConstrainedTrue()) {
+        os << " (assuming the call returns zero)";
+      } else if (CurrSt->isNonNull(RV).isConstrainedTrue()) {
+        os << " (assuming the call returns non-zero)";
+      }
+
+    }
   }
 }
 
@@ -292,15 +413,38 @@ annotateConsumedSummaryMismatch(const ExplodedNode *N,
   if (os.str().empty())
     return nullptr;
 
-  // FIXME: remove the code duplication with NoStoreFuncVisitor.
-  PathDiagnosticLocation L;
-  if (const ReturnStmt *RS = CallExitLoc.getReturnStmt()) {
-    L = PathDiagnosticLocation::createBegin(RS, SM, N->getLocationContext());
-  } else {
-    L = PathDiagnosticLocation(
-        Call->getRuntimeDefinition().getDecl()->getSourceRange().getEnd(), SM);
-  }
+  PathDiagnosticLocation L = PathDiagnosticLocation::create(CallExitLoc, SM);
+  return std::make_shared<PathDiagnosticEventPiece>(L, os.str());
+}
 
+/// Annotate the parameter at the analysis entry point.
+static std::shared_ptr<PathDiagnosticEventPiece>
+annotateStartParameter(const ExplodedNode *N, SymbolRef Sym,
+                       const SourceManager &SM) {
+  auto PP = N->getLocationAs<BlockEdge>();
+  if (!PP)
+    return nullptr;
+
+  const CFGBlock *Src = PP->getSrc();
+  const RefVal *CurrT = getRefBinding(N->getState(), Sym);
+
+  if (&Src->getParent()->getEntry() != Src || !CurrT ||
+      getRefBinding(N->getFirstPred()->getState(), Sym))
+    return nullptr;
+
+  const auto *VR = cast<VarRegion>(cast<SymbolRegionValue>(Sym)->getRegion());
+  const auto *PVD = cast<ParmVarDecl>(VR->getDecl());
+  PathDiagnosticLocation L = PathDiagnosticLocation(PVD, SM);
+
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  os << "Parameter '" << PVD->getNameAsString() << "' starts at +";
+  if (CurrT->getCount() == 1) {
+    os << "1, as it is marked as consuming";
+  } else {
+    assert(CurrT->getCount() == 0);
+    os << "0";
+  }
   return std::make_shared<PathDiagnosticEventPiece>(L, os.str());
 }
 
@@ -308,11 +452,21 @@ std::shared_ptr<PathDiagnosticPiece>
 RefCountReportVisitor::VisitNode(const ExplodedNode *N,
                               BugReporterContext &BRC, BugReport &BR) {
 
+  const auto &BT = static_cast<const RefCountBug&>(BR.getBugType());
+  const auto *Checker =
+      static_cast<const RetainCountChecker *>(BT.getChecker());
+
+  bool IsFreeUnowned = BT.getBugType() == RefCountBug::FreeNotOwned ||
+                       BT.getBugType() == RefCountBug::DeallocNotOwned;
+
   const SourceManager &SM = BRC.getSourceManager();
   CallEventManager &CEMgr = BRC.getStateManager().getCallEventManager();
   if (auto CE = N->getLocationAs<CallExitBegin>())
     if (auto PD = annotateConsumedSummaryMismatch(N, *CE, SM, CEMgr))
       return PD;
+
+  if (auto PD = annotateStartParameter(N, Sym, SM))
+    return PD;
 
   // FIXME: We will eventually need to handle non-statement-based events
   // (__attribute__((cleanup))).
@@ -326,7 +480,8 @@ RefCountReportVisitor::VisitNode(const ExplodedNode *N,
   const LocationContext *LCtx = N->getLocationContext();
 
   const RefVal* CurrT = getRefBinding(CurrSt, Sym);
-  if (!CurrT) return nullptr;
+  if (!CurrT)
+    return nullptr;
 
   const RefVal &CurrV = *CurrT;
   const RefVal *PrevT = getRefBinding(PrevSt, Sym);
@@ -335,6 +490,12 @@ RefCountReportVisitor::VisitNode(const ExplodedNode *N,
   // to tell the user.
   std::string sbuf;
   llvm::raw_string_ostream os(sbuf);
+
+  if (PrevT && IsFreeUnowned && CurrV.isNotOwned() && PrevT->isOwned()) {
+    os << "Object is now not exclusively owned";
+    auto Pos = PathDiagnosticLocation::create(N->getLocation(), SM);
+    return std::make_shared<PathDiagnosticEventPiece>(Pos, os.str());
+  }
 
   // This is the allocation site since the previous node had no bindings
   // for this symbol.
@@ -382,9 +543,13 @@ RefCountReportVisitor::VisitNode(const ExplodedNode *N,
   // program point
   bool DeallocSent = false;
 
-  if (N->getLocation().getTag() &&
-      N->getLocation().getTag()->getTagDescription().contains(
-          RetainCountChecker::DeallocTagDescription)) {
+  const ProgramPointTag *Tag = N->getLocation().getTag();
+
+  if (Tag == &Checker->getCastFailTag()) {
+    os << "Assuming dynamic cast returns null due to type mismatch";
+  }
+
+  if (Tag == &Checker->getDeallocSentTag()) {
     // We only have summaries attached to nodes after evaluating CallExpr and
     // ObjCMessageExprs.
     const Stmt *S = N->getLocation().castAs<StmtPoint>().getStmt();
@@ -541,7 +706,7 @@ static AllocationInfo GetAllocationSite(ProgramStateManager &StateMgr,
 
   if (AllocationNodeInCurrentOrParentContext &&
       AllocationNodeInCurrentOrParentContext->getLocationContext() !=
-          LeakContext)
+      LeakContext)
     FirstBinding = nullptr;
 
   return AllocationInfo(AllocationNodeInCurrentOrParentContext,
@@ -625,10 +790,19 @@ RefLeakReportVisitor::getEndPath(BugReporterContext &BRC,
         }
       } else {
         const FunctionDecl *FD = cast<FunctionDecl>(D);
-        os << "whose name ('" << *FD
-           << "') does not contain 'Copy' or 'Create'.  This violates the naming"
-              " convention rules given in the Memory Management Guide for Core"
-              " Foundation";
+        ObjKind K = RV->getObjKind();
+        if (K == ObjKind::ObjC || K == ObjKind::CF) {
+          os << "whose name ('" << *FD
+             << "') does not contain 'Copy' or 'Create'.  This violates the "
+                "naming"
+                " convention rules given in the Memory Management Guide for "
+                "Core"
+                " Foundation";
+        } else if (RV->getObjKind() == ObjKind::OS) {
+          std::string FuncName = FD->getNameAsString();
+          os << "whose name ('" << FuncName
+            << "') starts with '" << StringRef(FuncName).substr(0, 3) << "'";
+        }
       }
     }
   } else {
@@ -639,15 +813,15 @@ RefLeakReportVisitor::getEndPath(BugReporterContext &BRC,
   return std::make_shared<PathDiagnosticEventPiece>(L, os.str());
 }
 
-RefCountReport::RefCountReport(RefCountBug &D, const LangOptions &LOpts,
+RefCountReport::RefCountReport(const RefCountBug &D, const LangOptions &LOpts,
                                ExplodedNode *n, SymbolRef sym,
-                               bool registerVisitor)
-    : BugReport(D, D.getDescription(), n), Sym(sym) {
-  if (registerVisitor)
+                               bool isLeak)
+    : BugReport(D, D.getDescription(), n), Sym(sym), isLeak(isLeak) {
+  if (!isLeak)
     addVisitor(llvm::make_unique<RefCountReportVisitor>(sym));
 }
 
-RefCountReport::RefCountReport(RefCountBug &D, const LangOptions &LOpts,
+RefCountReport::RefCountReport(const RefCountBug &D, const LangOptions &LOpts,
                                ExplodedNode *n, SymbolRef sym,
                                StringRef endText)
     : BugReport(D, D.getDescription(), endText, n) {
@@ -733,10 +907,10 @@ void RefLeakReport::createDescription(CheckerContext &Ctx) {
   }
 }
 
-RefLeakReport::RefLeakReport(RefCountBug &D, const LangOptions &LOpts,
+RefLeakReport::RefLeakReport(const RefCountBug &D, const LangOptions &LOpts,
                              ExplodedNode *n, SymbolRef sym,
                              CheckerContext &Ctx)
-    : RefCountReport(D, LOpts, n, sym, false) {
+    : RefCountReport(D, LOpts, n, sym, /*isLeak=*/true) {
 
   deriveAllocLocation(Ctx, sym);
   if (!AllocBinding)

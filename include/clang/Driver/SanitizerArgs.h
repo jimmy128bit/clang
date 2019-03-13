@@ -1,9 +1,8 @@
 //===--- SanitizerArgs.h - Arguments for sanitizer tools  -------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 #ifndef LLVM_CLANG_DRIVER_SANITIZERARGS_H
@@ -74,13 +73,11 @@ class SanitizerArgs {
   bool needsCfiRt() const;
   bool needsCfiDiagRt() const;
   bool needsStatsRt() const { return Stats; }
-  bool needsEsanRt() const {
-    return Sanitizers.hasOneOf(SanitizerKind::Efficiency);
-  }
   bool needsScudoRt() const { return Sanitizers.has(SanitizerKind::Scudo); }
 
   bool requiresPIE() const;
   bool needsUnwindTables() const;
+  bool needsLTO() const;
   bool linkCXXRuntimes() const { return LinkCXXRuntimes; }
   bool hasCrossDsoCfi() const { return CfiCrossDso; }
   bool hasAnySanitizer() const { return !Sanitizers.empty(); }

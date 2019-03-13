@@ -1,9 +1,8 @@
 //===--- CrossTranslationUnit.h - -------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -44,7 +43,8 @@ enum class index_error_code {
   failed_to_get_external_ast,
   failed_to_generate_usr,
   triple_mismatch,
-  lang_mismatch
+  lang_mismatch,
+  lang_dialect_mismatch
 };
 
 class IndexError : public llvm::ErrorInfo<IndexError> {

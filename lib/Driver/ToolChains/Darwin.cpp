@@ -1,9 +1,8 @@
 //===--- Darwin.cpp - Darwin Tool and ToolChain Implementations -*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -224,13 +223,20 @@ void darwin::Linker::AddLinkArgs(Compilation &C, const ArgList &Args,
                    options::OPT_fno_application_extension, false))
     CmdArgs.push_back("-application_extension");
 
-  if (D.isUsingLTO()) {
-    // If we are using LTO, then automatically create a temporary file path for
-    // the linker to use, so that it's lifetime will extend past a possible
-    // dsymutil step.
-    if (Version[0] >= 116 && NeedsTempPath(Inputs)) {
-      const char *TmpPath = C.getArgs().MakeArgString(
-          D.GetTemporaryPath("cc", types::getTypeTempSuffix(types::TY_Object)));
+  if (D.isUsingLTO() && Version[0] >= 116 && NeedsTempPath(Inputs)) {
+    std::string TmpPathName;
+    if (D.getLTOMode() == LTOK_Full) {
+      // If we are using full LTO, then automatically create a temporary file
+      // path for the linker to use, so that it's lifetime will extend past a
+      // possible dsymutil step.
+      TmpPathName =
+          D.GetTemporaryPath("cc", types::getTypeTempSuffix(types::TY_Object));
+    } else if (D.getLTOMode() == LTOK_Thin)
+      // If we are using thin LTO, then create a directory instead.
+      TmpPathName = D.GetTemporaryDirectory("thinlto");
+
+    if (!TmpPathName.empty()) {
+      auto *TmpPath = C.getArgs().MakeArgString(TmpPathName);
       C.addTempFile(TmpPath);
       CmdArgs.push_back("-object_path_lto");
       CmdArgs.push_back(TmpPath);
@@ -476,6 +482,14 @@ void darwin::Linker::ConstructJob(Compilation &C, const JobAction &JA,
             std::string("-lto-pass-remarks-hotness-threshold=") + A->getValue();
         CmdArgs.push_back(Args.MakeArgString(Opt));
       }
+    }
+
+    if (const Arg *A =
+            Args.getLastArg(options::OPT_foptimization_record_passes_EQ)) {
+      CmdArgs.push_back("-mllvm");
+      std::string Passes =
+          std::string("-lto-pass-remarks-filter=") + A->getValue();
+      CmdArgs.push_back(Args.MakeArgString(Passes));
     }
   }
 
@@ -1042,7 +1056,6 @@ void Darwin::addProfileRTLibs(const ArgList &Args,
       addExportedSymbol(CmdArgs, "___llvm_profile_filename");
       addExportedSymbol(CmdArgs, "___llvm_profile_raw_version");
       addExportedSymbol(CmdArgs, "_lprofCurFilename");
-      addExportedSymbol(CmdArgs, "_lprofMergeValueProfData");
     }
     addExportedSymbol(CmdArgs, "_lprofDirMode");
   }
@@ -1110,8 +1123,6 @@ void DarwinClang::AddLinkRuntimeLibArgs(const ArgList &Args,
     AddLinkRuntimeLib(Args, CmdArgs, "stats_client", RLO_AlwaysLink);
     AddLinkSanitizerLibArgs(Args, CmdArgs, "stats");
   }
-  if (Sanitize.needsEsanRt())
-    AddLinkSanitizerLibArgs(Args, CmdArgs, "esan");
 
   const XRayArgs &XRay = getXRayArgs();
   if (XRay.needsXRayRt()) {
@@ -2283,22 +2294,27 @@ void Darwin::addStartObjectFileArgs(const ArgList &Args,
       }
     } else {
       if (Args.hasArg(options::OPT_pg) && SupportsProfiling()) {
-        if (Args.hasArg(options::OPT_static) ||
-            Args.hasArg(options::OPT_object) ||
-            Args.hasArg(options::OPT_preload)) {
-          CmdArgs.push_back("-lgcrt0.o");
-        } else {
-          CmdArgs.push_back("-lgcrt1.o");
+        if (isTargetMacOS() && isMacosxVersionLT(10, 9)) {
+          if (Args.hasArg(options::OPT_static) ||
+              Args.hasArg(options::OPT_object) ||
+              Args.hasArg(options::OPT_preload)) {
+            CmdArgs.push_back("-lgcrt0.o");
+          } else {
+            CmdArgs.push_back("-lgcrt1.o");
 
-          // darwin_crt2 spec is empty.
+            // darwin_crt2 spec is empty.
+          }
+          // By default on OS X 10.8 and later, we don't link with a crt1.o
+          // file and the linker knows to use _main as the entry point.  But,
+          // when compiling with -pg, we need to link with the gcrt1.o file,
+          // so pass the -no_new_main option to tell the linker to use the
+          // "start" symbol as the entry point.
+          if (isTargetMacOS() && !isMacosxVersionLT(10, 8))
+            CmdArgs.push_back("-no_new_main");
+        } else {
+          getDriver().Diag(diag::err_drv_clang_unsupported_opt_pg_darwin)
+              << isTargetMacOS();
         }
-        // By default on OS X 10.8 and later, we don't link with a crt1.o
-        // file and the linker knows to use _main as the entry point.  But,
-        // when compiling with -pg, we need to link with the gcrt1.o file,
-        // so pass the -no_new_main option to tell the linker to use the
-        // "start" symbol as the entry point.
-        if (isTargetMacOS() && !isMacosxVersionLT(10, 8))
-          CmdArgs.push_back("-no_new_main");
       } else {
         if (Args.hasArg(options::OPT_static) ||
             Args.hasArg(options::OPT_object) ||

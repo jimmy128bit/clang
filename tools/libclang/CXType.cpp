@@ -1,9 +1,8 @@
-//===- CXTypes.cpp - Implements 'CXTypes' aspect of libclang ------------===//
+//===- CXType.cpp - Implements 'CXTypes' aspect of libclang ---------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===--------------------------------------------------------------------===//
 //
@@ -129,7 +128,9 @@ CXType cxtype::MakeCXType(QualType T, CXTranslationUnit TU) {
     // Handle attributed types as the original type
     if (auto *ATT = T->getAs<AttributedType>()) {
       if (!(TU->ParsingOptions & CXTranslationUnit_IncludeAttributedTypes)) {
-        return MakeCXType(ATT->getModifiedType(), TU);
+        // Return the equivalent type which represents the canonically
+        // equivalent type.
+        return MakeCXType(ATT->getEquivalentType(), TU);
       }
     }
     // Handle paren types as the original type
@@ -890,6 +891,9 @@ long long clang_Type_getAlignOf(CXType T) {
     return CXTypeLayoutError_Incomplete;
   if (QT->isDependentType())
     return CXTypeLayoutError_Dependent;
+  if (const auto *Deduced = dyn_cast<DeducedType>(QT))
+    if (Deduced->getDeducedType().isNull())
+      return CXTypeLayoutError_Undeduced;
   // Exceptions by GCC extension - see ASTContext.cpp:1313 getTypeInfoImpl
   // if (QT->isFunctionType()) return 4; // Bug #15511 - should be 1
   // if (QT->isVoidType()) return 1;
@@ -927,6 +931,9 @@ long long clang_Type_getSizeOf(CXType T) {
     return CXTypeLayoutError_Dependent;
   if (!QT->isConstantSizeType())
     return CXTypeLayoutError_NotConstantSize;
+  if (const auto *Deduced = dyn_cast<DeducedType>(QT))
+    if (Deduced->getDeducedType().isNull())
+      return CXTypeLayoutError_Undeduced;
   // [gcc extension] lib/AST/ExprConstant.cpp:1372
   //                 HandleSizeof : {voidtype,functype} == 1
   // not handled by ASTContext.cpp:1313 getTypeInfoImpl

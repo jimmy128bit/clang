@@ -1,9 +1,8 @@
 //===--- CrossTranslationUnit.cpp - -----------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -43,6 +42,7 @@ STATISTIC(NumGetCTUSuccess,
           "requested function's body");
 STATISTIC(NumTripleMismatch, "The # of triple mismatches");
 STATISTIC(NumLangMismatch, "The # of language mismatches");
+STATISTIC(NumLangDialectMismatch, "The # of language dialect mismatches");
 
 // Same as Triple's equality operator, but we check a field only if that is
 // known in both instances.
@@ -100,6 +100,8 @@ public:
       return "Triple mismatch";
     case index_error_code::lang_mismatch:
       return "Language mismatch";
+    case index_error_code::lang_dialect_mismatch:
+      return "Language dialect mismatch";
     }
     llvm_unreachable("Unrecognized index_error_code.");
   }
@@ -229,11 +231,34 @@ CrossTranslationUnitContext::getCrossTUDefinition(const FunctionDecl *FD,
 
   const auto &LangTo = Context.getLangOpts();
   const auto &LangFrom = Unit->getASTContext().getLangOpts();
+
   // FIXME: Currenty we do not support CTU across C++ and C and across
   // different dialects of C++.
   if (LangTo.CPlusPlus != LangFrom.CPlusPlus) {
     ++NumLangMismatch;
     return llvm::make_error<IndexError>(index_error_code::lang_mismatch);
+  }
+
+  // If CPP dialects are different then return with error.
+  //
+  // Consider this STL code:
+  //   template<typename _Alloc>
+  //     struct __alloc_traits
+  //   #if __cplusplus >= 201103L
+  //     : std::allocator_traits<_Alloc>
+  //   #endif
+  //     { // ...
+  //     };
+  // This class template would create ODR errors during merging the two units,
+  // since in one translation unit the class template has a base class, however
+  // in the other unit it has none.
+  if (LangTo.CPlusPlus11 != LangFrom.CPlusPlus11 ||
+      LangTo.CPlusPlus14 != LangFrom.CPlusPlus14 ||
+      LangTo.CPlusPlus17 != LangFrom.CPlusPlus17 ||
+      LangTo.CPlusPlus2a != LangFrom.CPlusPlus2a) {
+    ++NumLangDialectMismatch;
+    return llvm::make_error<IndexError>(
+        index_error_code::lang_dialect_mismatch);
   }
 
   TranslationUnitDecl *TU = Unit->getASTContext().getTranslationUnitDecl();

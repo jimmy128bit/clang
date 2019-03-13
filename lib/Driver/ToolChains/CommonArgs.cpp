@@ -1,9 +1,8 @@
 //===--- CommonArgs.cpp - Args handling for multiple toolchains -*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -220,21 +219,6 @@ static std::string getR600TargetGPU(const ArgList &Args) {
   return "";
 }
 
-static std::string getNios2TargetCPU(const ArgList &Args) {
-  Arg *A = Args.getLastArg(options::OPT_mcpu_EQ);
-  if (!A)
-    A = Args.getLastArg(options::OPT_march_EQ);
-
-  if (!A)
-    return "";
-
-  const char *name = A->getValue();
-  return llvm::StringSwitch<const char *>(name)
-      .Case("r1", "nios2r1")
-      .Case("r2", "nios2r2")
-      .Default(name);
-}
-
 static std::string getLanaiTargetCPU(const ArgList &Args) {
   if (Arg *A = Args.getLastArg(options::OPT_mcpu_EQ)) {
     return A->getValue();
@@ -286,10 +270,6 @@ std::string tools::getCPUName(const ArgList &Args, const llvm::Triple &T,
     if (const Arg *A = Args.getLastArg(options::OPT_mmcu_EQ))
       return A->getValue();
     return "";
-
-  case llvm::Triple::nios2: {
-    return getNios2TargetCPU(Args);
-  }
 
   case llvm::Triple::mips:
   case llvm::Triple::mipsel:
@@ -463,6 +443,31 @@ void tools::AddGoldPlugin(const ToolChain &ToolChain, const ArgList &Args,
           Args.MakeArgString(Twine("-plugin-opt=sample-profile=") + FName));
   }
 
+  auto *CSPGOGenerateArg = Args.getLastArg(options::OPT_fcs_profile_generate,
+                                           options::OPT_fcs_profile_generate_EQ,
+                                           options::OPT_fno_profile_generate);
+  if (CSPGOGenerateArg &&
+      CSPGOGenerateArg->getOption().matches(options::OPT_fno_profile_generate))
+    CSPGOGenerateArg = nullptr;
+
+  auto *ProfileUseArg = getLastProfileUseArg(Args);
+
+  if (CSPGOGenerateArg) {
+    CmdArgs.push_back(Args.MakeArgString("-plugin-opt=cs-profile-generate"));
+    if (CSPGOGenerateArg->getOption().matches(
+            options::OPT_fcs_profile_generate_EQ)) {
+      SmallString<128> Path(CSPGOGenerateArg->getValue());
+      llvm::sys::path::append(Path, "default_%m.profraw");
+      CmdArgs.push_back(
+          Args.MakeArgString(Twine("-plugin-opt=cs-profile-path=") + Path));
+    } else
+      CmdArgs.push_back(
+          Args.MakeArgString("-plugin-opt=cs-profile-path=default_%m.profraw"));
+  } else if (ProfileUseArg) {
+    CmdArgs.push_back(Args.MakeArgString(Twine("-plugin-opt=cs-profile-path=") +
+                                         ProfileUseArg->getValue()));
+  }
+
   // Need this flag to turn on new pass manager via Gold plugin.
   if (Args.hasFlag(options::OPT_fexperimental_new_pass_manager,
                    options::OPT_fno_experimental_new_pass_manager,
@@ -530,7 +535,8 @@ static void addSanitizerRuntime(const ToolChain &TC, const ArgList &Args,
   // Wrap any static runtimes that must be forced into executable in
   // whole-archive.
   if (IsWhole) CmdArgs.push_back("--whole-archive");
-  CmdArgs.push_back(TC.getCompilerRTArgString(Args, Sanitizer, IsShared));
+  CmdArgs.push_back(TC.getCompilerRTArgString(
+      Args, Sanitizer, IsShared ? ToolChain::FT_Shared : ToolChain::FT_Static));
   if (IsWhole) CmdArgs.push_back("--no-whole-archive");
 
   if (IsShared) {
@@ -708,8 +714,6 @@ collectSanitizerRuntimes(const ToolChain &TC, const ArgList &Args,
     NonWholeStaticRuntimes.push_back("stats");
     RequiredSymbols.push_back("__sanitizer_stats_register");
   }
-  if (SanArgs.needsEsanRt())
-    StaticRuntimes.push_back("esan");
   if (SanArgs.needsScudoRt()) {
     if (SanArgs.requiresMinimalRuntime()) {
       StaticRuntimes.push_back("scudo_minimal");
@@ -777,9 +781,9 @@ bool tools::addXRayRuntime(const ToolChain&TC, const ArgList &Args, ArgStringLis
 
   if (TC.getXRayArgs().needsXRayRt()) {
     CmdArgs.push_back("-whole-archive");
-    CmdArgs.push_back(TC.getCompilerRTArgString(Args, "xray", false));
+    CmdArgs.push_back(TC.getCompilerRTArgString(Args, "xray"));
     for (const auto &Mode : TC.getXRayArgs().modeList())
-      CmdArgs.push_back(TC.getCompilerRTArgString(Args, Mode, false));
+      CmdArgs.push_back(TC.getCompilerRTArgString(Args, Mode));
     CmdArgs.push_back("-no-whole-archive");
     return true;
   }
@@ -1157,19 +1161,22 @@ static void AddLibgcc(const llvm::Triple &Triple, const Driver &D,
   bool isCygMing = Triple.isOSCygMing();
   bool IsIAMCU = Triple.isOSIAMCU();
   bool StaticLibgcc = Args.hasArg(options::OPT_static_libgcc) ||
-                      Args.hasArg(options::OPT_static);
+                      Args.hasArg(options::OPT_static) ||
+                      Args.hasArg(options::OPT_static_pie);
 
   bool SharedLibgcc = Args.hasArg(options::OPT_shared_libgcc);
   bool UnspecifiedLibgcc = !StaticLibgcc && !SharedLibgcc;
 
   // Gcc adds libgcc arguments in various ways:
   //
-  // gcc <none>: -lgcc --as-needed -lgcc_s --no-as-needed
-  // g++ <none>:                   -lgcc_s               -lgcc
-  // gcc shared:                   -lgcc_s               -lgcc
-  // g++ shared:                   -lgcc_s               -lgcc
-  // gcc static: -lgcc             -lgcc_eh
-  // g++ static: -lgcc             -lgcc_eh
+  // gcc <none>:     -lgcc --as-needed -lgcc_s --no-as-needed
+  // g++ <none>:                       -lgcc_s               -lgcc
+  // gcc shared:                       -lgcc_s               -lgcc
+  // g++ shared:                       -lgcc_s               -lgcc
+  // gcc static:     -lgcc             -lgcc_eh
+  // g++ static:     -lgcc             -lgcc_eh
+  // gcc static-pie: -lgcc             -lgcc_eh
+  // g++ static-pie: -lgcc             -lgcc_eh
   //
   // Also, certain targets need additional adjustments.
 

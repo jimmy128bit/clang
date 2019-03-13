@@ -27,6 +27,17 @@
 // RUN:  -analyzer-config cplusplus.Move:WarnOn=All -DAGGRESSIVE\
 // RUN:  -analyzer-checker debug.ExprInspection
 
+// RUN: not %clang_analyze_cc1 -verify %s \
+// RUN:   -analyzer-checker=core \
+// RUN:   -analyzer-checker=cplusplus.Move \
+// RUN:   -analyzer-config cplusplus.Move:WarnOn="a bunch of things" \
+// RUN:   2>&1 | FileCheck %s -check-prefix=CHECK-MOVE-INVALID-VALUE
+
+// CHECK-MOVE-INVALID-VALUE: (frontend): invalid input for checker option
+// CHECK-MOVE-INVALID-VALUE-SAME: 'cplusplus.Move:WarnOn', that expects either
+// CHECK-MOVE-INVALID-VALUE-SAME: "KnownsOnly", "KnownsAndLocals" or "All"
+// CHECK-MOVE-INVALID-VALUE-SAME: string value
+
 #include "Inputs/system-header-simulator-cxx.h"
 
 void clang_analyzer_warnIfReached();
@@ -89,6 +100,7 @@ public:
   void destroy();
   void clear();
   void resize(std::size_t);
+  void assign(const A &);
   bool empty() const;
   bool isEmpty() const;
   operator bool() const;
@@ -528,6 +540,13 @@ void moveStateResetFunctionsTest() {
     A a;
     A b = std::move(a);
     a.resize(0); // no-warning
+    a.foo();   // no-warning
+    a.b.foo(); // no-warning
+  }
+  {
+    A a;
+    A b = std::move(a);
+    a.assign(A()); // no-warning
     a.foo();   // no-warning
     a.b.foo(); // no-warning
   }
